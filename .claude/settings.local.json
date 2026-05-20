@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(pip3 --version)",
+      "Bash(pip3 install *)",
+      "Bash(python3 -m venv .venv)",
+      "Bash(.venv/bin/pip install *)",
+      "Bash(python3 /Users/mohanprasath/Documents/Mohan/RoboAdvisor/robo_invester.py --mode paper)",
+      "Bash(.venv/bin/python3 --version)",
+      "Bash(.venv/bin/python3 robo_invester.py --mode paper)"
+    ]
+  }
+}
