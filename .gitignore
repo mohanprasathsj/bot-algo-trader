@@ -1,0 +1,16 @@
+# Virtual environment
+.venv/
+
+# Claude Code session data
+.claude/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+
+# macOS
+.DS_Store
