@@ -32,7 +32,7 @@ if __name__ == "__main__":
         default="backtest",
         help="backtest = historical hourly | paper = recent 60-day replay | live = hourly loop",
     )
-    parser.add_argument("--capital", type=float, default=5_000.0, help="Total bot capital in USD")
+    parser.add_argument("--capital", type=float, default=2_000.0, help="Total bot capital in USD")
     parser.add_argument("--start",   default="2022-01-01",         help="Backtest start date")
     parser.add_argument("--end",     default="2023-01-01",         help="Backtest end date")
     args = parser.parse_args()

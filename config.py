@@ -87,7 +87,7 @@ class ExperimentalConfig:
     macd_signal: int = 9
     volume_multiplier: float = 1.3
     max_hold_hours: int = 2373      # 365 trading days × 6.5h
-    min_hold_hours: int = 0
+    min_hold_hours: int = 65
     stop_loss_pct: float = 0.02
     take_profit_pct: float = 0.05
     max_position_pct: float = 0.33
