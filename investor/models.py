@@ -49,6 +49,22 @@ class Position:
         return False, ""
 
 
+@dataclass
+class TradeRecord:
+    """Immutable record of a single executed trade (buy or sell)."""
+    timestamp: datetime
+    symbol: str
+    side: str            # "buy" | "sell"
+    bucket: str          # "tactical" | "experimental"
+    shares: int
+    price: float         # actual fill price
+    fee: float
+    spread_cost: float
+    pnl: float           # realized PnL (0.0 for buys)
+    reason: str          # signal reason, e.g. "RSI oversold (32.1)"
+    ibkr_order_id: int | None = None
+
+
 class CircuitBreaker:
     """
     Trips if total equity drops max_drawdown from its peak.

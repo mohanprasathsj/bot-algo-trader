@@ -19,6 +19,49 @@ def compute_rsi(prices: list[float], period: int = 14) -> float | None:
     return 100.0 - (100.0 / (1 + rs))
 
 
+def compute_sma(prices: list[float], period: int) -> float | None:
+    """Simple moving average over the last `period` bars. Returns None if insufficient data."""
+    if len(prices) < period:
+        return None
+    return float(np.mean(prices[-period:]))
+
+
+def compute_52w_high(prices: list[float], bars_per_year: int = 1638) -> float | None:
+    """52-week high using hourly bars (52 wks × 5 days × 6.3 h/day ≈ 1638 bars).
+
+    Falls back to all available data if fewer than `bars_per_year` bars exist, so
+    a fresh warmup still produces a useful (conservative) estimate.
+    """
+    if not prices:
+        return None
+    window = prices[-bars_per_year:] if len(prices) >= bars_per_year else prices
+    return float(max(window))
+
+
+def detect_rsi_divergence(
+    prices: list[float],
+    rsi_period: int = 14,
+    lookback: int = 10,
+) -> bool:
+    """Bullish RSI divergence: price makes a lower low while RSI makes a higher low.
+
+    This signals that downward momentum is *slowing* — a prerequisite for a real
+    bounce rather than a continued slide.  Returns False when there is not enough
+    data to compute the check (caller should treat this as "skip the guard").
+    """
+    min_len = rsi_period + 1 + lookback
+    if len(prices) < min_len:
+        return False
+    rsi_now   = compute_rsi(prices,            rsi_period)
+    rsi_prior = compute_rsi(prices[:-lookback], rsi_period)
+    if rsi_now is None or rsi_prior is None:
+        return False
+    price_now   = prices[-1]
+    price_prior = prices[-1 - lookback]
+    # Price lower + RSI higher → bullish divergence
+    return price_now < price_prior and rsi_now > rsi_prior
+
+
 def compute_ema(prices: list[float], period: int) -> float | None:
     if len(prices) < period:
         return None

@@ -2,14 +2,13 @@
 """
 Investment Advisor — main entry point.
 
-Usage:
-    python main.py                         # analyse all sector ETFs
-    python main.py XLK XLF NVDA AAPL      # analyse specific tickers
-    python main.py --output recs.json      # save results to JSON
+Usage (run from project root):
+    python -m advisor.main                         # analyse all sector ETFs
+    python -m advisor.main XLK XLF NVDA AAPL      # analyse specific tickers
+    python -m advisor.main --output recs.json      # save results to JSON
 
 Environment:
-    Copy .env.example → .env and fill in your API keys, then:
-        pip install python-dotenv
+    Copy .env.example → .env at the project root and fill in your API keys.
     The script auto-loads .env if present.
 """
 
@@ -21,7 +20,10 @@ import logging
 import sys
 from pathlib import Path
 
-# Auto-load .env if python-dotenv is installed
+# Ensure investment_advisor package is importable when running as a module
+sys.path.insert(0, str(Path(__file__).parent))
+
+# Auto-load .env — searches from cwd upward (finds root .env when run from project root)
 try:
     from dotenv import load_dotenv
     load_dotenv()

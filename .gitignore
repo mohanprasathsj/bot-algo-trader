@@ -16,3 +16,16 @@ build/
 .DS_Store
 
 .env
+
+settings.json
+
+# Investor runtime files
+investor/data/state.json
+investor/logs/*.log
+investor/logs/*.jsonl
+investor/logs/risk_*.log
+investor/logs/daily_*.txt
+
+*.local.*
+*.local
+
