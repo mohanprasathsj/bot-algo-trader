@@ -48,13 +48,167 @@ def _fetch_hourly(tickers: list[str], days: int = WARMUP_DAYS):
     return yf.download(tickers, start=start, end=end, interval="1h", progress=False, auto_adjust=True)
 
 
+def _to_multi_ticker(ticker_dfs: dict) -> "pd.DataFrame":
+    """Combine per-ticker DataFrames into yfinance-style MultiIndex format.
+
+    yfinance multi-ticker output:  raw["Close"]["AAPL"]  →  Series
+    We reconstruct that exact shape from individually-cached DataFrames so the
+    rest of the engine needs no changes.
+    """
+    import pandas as pd
+    ohlcv_cols = ["Open", "High", "Low", "Close", "Volume"]
+    frames = []
+    for ticker in sorted(ticker_dfs):
+        df  = ticker_dfs[ticker]
+        cols = [c for c in ohlcv_cols if c in df.columns]
+        sub  = df[cols].copy()
+        sub.columns = pd.MultiIndex.from_tuples([(col, ticker) for col in cols])
+        frames.append(sub)
+    if not frames:
+        return pd.DataFrame()
+    combined = pd.concat(frames, axis=1)
+    combined.sort_index(inplace=True)
+    combined.sort_index(axis=1, inplace=True)
+    return combined
+
+
+def _fetch_hourly_cached(tickers: list[str], days: int = WARMUP_DAYS) -> "pd.DataFrame":
+    """Cache-aware hourly fetch.
+
+    Each ticker is loaded from its local Parquet file; only the missing tail
+    (usually 1 trading day) is downloaded from yfinance.  Falls back to the
+    original batch download if the cache layer fails entirely.
+    """
+    from .cache import get_ticker_ohlcv
+    end   = datetime.today()
+    start = end - timedelta(days=days)
+
+    ticker_dfs: dict = {}
+    failed: list[str] = []
+    for ticker in tickers:
+        df = get_ticker_ohlcv(ticker, "1h", start, end)
+        if df is not None and not df.empty:
+            ticker_dfs[ticker] = df
+        else:
+            failed.append(ticker)
+
+    if failed:
+        logger.warning(
+            f"[cache] Hourly cache miss for {failed} — "
+            "falling back to direct yfinance batch download"
+        )
+        return _fetch_hourly(tickers, days)
+
+    return _to_multi_ticker(ticker_dfs)
+
+
+def _fetch_daily_cached(tickers: list[str], start: str, end: str) -> "pd.DataFrame":
+    """Cache-aware daily fetch.
+
+    Each tactical ticker is stored in its own Parquet file.  Only the delta
+    since the last cached bar is fetched; the full multi-ticker DataFrame is
+    reconstructed in the same shape as `_fetch_daily` so callers need no change.
+    Falls back to `_fetch_daily` if the cache layer errors.
+    """
+    from .cache import get_ticker_ohlcv
+    start_dt = datetime.strptime(start, "%Y-%m-%d")
+    end_dt   = datetime.strptime(end,   "%Y-%m-%d") + timedelta(days=1)  # end is exclusive
+
+    ticker_dfs: dict = {}
+    failed: list[str] = []
+    for ticker in tickers:
+        df = get_ticker_ohlcv(ticker, "1d", start_dt, end_dt)
+        if df is not None and not df.empty:
+            ticker_dfs[ticker] = df
+        else:
+            failed.append(ticker)
+
+    if failed:
+        logger.warning(
+            f"[cache] Daily cache miss for {failed} — "
+            "falling back to _fetch_daily"
+        )
+        if ticker_dfs:
+            # Merge what we have from cache with a fresh batch call for the failures
+            fallback = _fetch_daily(failed, start, end)
+            # Pull per-ticker frames from the fallback and add to ticker_dfs
+            import pandas as pd
+            if not fallback.empty:
+                try:
+                    close_block = fallback["Close"]
+                    for t in failed:
+                        if isinstance(close_block, pd.DataFrame) and t in close_block.columns:
+                            sub_df = fallback.xs(t, axis=1, level=1)
+                            ticker_dfs[t] = sub_df
+                except Exception:
+                    pass
+        else:
+            return _fetch_daily(tickers, start, end)
+
+    return _to_multi_ticker(ticker_dfs)
+
+
 def _fetch_daily(tickers: list[str], start: str, end: str):
-    """Fetch daily OHLCV data from yfinance for the knife-guard indicators."""
+    """Fetch daily OHLCV data from yfinance for the knife-guard indicators.
+
+    yfinance 1.2.x has an intermittent bug where some tickers in a batch
+    download fail with ``TypeError("'NoneType' object is not subscriptable")``
+    due to missing metadata.  After the initial batch we detect any missing
+    tickers and retry them one at a time, then merge the results back.
+    This keeps the fast path (one request) while recovering stragglers.
+    """
     try:
         import yfinance as yf
+        import pandas as pd
     except ImportError:
         raise SystemExit("Run: pip install yfinance")
-    return yf.download(tickers, start=start, end=end, interval="1d", progress=False, auto_adjust=True)
+
+    raw = yf.download(tickers, start=start, end=end, interval="1d", progress=False, auto_adjust=True)
+
+    # Detect tickers that are missing or entirely NaN in the batch result.
+    missing: list[str] = []
+    if not raw.empty:
+        try:
+            close_block = raw["Close"]
+            present = set(close_block.columns) if isinstance(close_block, pd.DataFrame) else set()
+            for t in tickers:
+                if t not in present or close_block[t].dropna().empty:
+                    missing.append(t)
+        except (KeyError, TypeError):
+            missing = list(tickers)   # fallback: retry everything
+    else:
+        missing = list(tickers)
+
+    if not missing:
+        return raw
+
+    # Per-ticker retry for stragglers — avoids the batch metadata bug.
+    logger.debug(f"Retrying {len(missing)} tickers individually: {missing}")
+    retry_frames: list = []
+    for t in missing:
+        try:
+            single = yf.download(t, start=start, end=end, interval="1d",
+                                 progress=False, auto_adjust=True)
+            if not single.empty:
+                # Wrap into multi-level columns to match the batch format.
+                single.columns = pd.MultiIndex.from_tuples(
+                    [(col, t) for col in single.columns]
+                )
+                retry_frames.append(single)
+                logger.debug(f"  ✓ {t}: {len(single)} rows recovered")
+            else:
+                logger.warning(f"  ✗ {t}: still empty after individual retry — knife guards will skip it")
+        except Exception as e:
+            logger.warning(f"  ✗ {t}: individual retry failed ({e}) — knife guards will skip it")
+
+    if retry_frames:
+        try:
+            recovered = pd.concat(retry_frames, axis=1)
+            raw = pd.concat([raw, recovered], axis=1).sort_index()
+        except Exception as e:
+            logger.warning(f"Could not merge retry data: {e}")
+
+    return raw
 
 
 def _build_daily_close_map(daily_raw, symbol: str, all_tickers: list[str]) -> dict:
@@ -207,11 +361,7 @@ def run_backtest(
     if tax_cfg is None:
         tax_cfg = TaxConfig()
 
-    try:
-        import yfinance as yf
-    except ImportError:
-        raise SystemExit("Run: pip install yfinance")
-
+    from .cache import cache_summary
     logger.info(
         f"\n{'='*60}\n"
         f"  ROBO INVESTOR — BACKTEST (hourly)\n"
@@ -224,24 +374,27 @@ def run_backtest(
         f"spread={brokerage_cfg.spread_pct:.2%})\n"
         f"  Tax      : CGT={tax_cfg.capital_gains_rate:.0%}  "
         f"Income={tax_cfg.income_tax_rate:.0%}  (Singapore defaults)\n"
+        f"  Local cache:\n{cache_summary()}\n"
         f"{'='*60}"
     )
 
     all_tickers = list(set(tactical_cfg.tickers + experimental_cfg.tickers))
 
-    # ── Hourly data (RSI, volume, divergence) ─────────────────────────── #
-    logger.info(f"Downloading hourly data  : {all_tickers}")
-    raw = yf.download(all_tickers, start=start, end=end, interval="1h", progress=False, auto_adjust=True)
+    # ── Hourly data (RSI, volume, divergence) — served from local cache ── #
+    # Each ticker's Parquet file is updated with only the missing tail;
+    # a cold-start ticker downloads its full history once and is fast after.
+    logger.info(f"Loading hourly data      : {all_tickers}")
+    raw = _fetch_hourly_cached(all_tickers, days=(datetime.strptime(end, "%Y-%m-%d") - datetime.strptime(start, "%Y-%m-%d")).days + 1)
     if raw.empty:
-        raise SystemExit("No data returned from yfinance.")
+        raise SystemExit("No hourly data returned (cache + yfinance both failed).")
 
     # ── Daily data (200-day MA, 52W high) — with pre-backtest warm-up ─── #
     # Fetch DAILY_WARMUP_DAYS before `start` so the 200-day MA and 52W high
     # have proper context from the very first bar of the backtest.
     start_dt    = datetime.strptime(start, "%Y-%m-%d")
     daily_start = (start_dt - timedelta(days=DAILY_WARMUP_DAYS)).strftime("%Y-%m-%d")
-    logger.info(f"Downloading daily data   : {tactical_cfg.tickers} ({daily_start} → {end})")
-    daily_raw = _fetch_daily(tactical_cfg.tickers, daily_start, end)
+    logger.info(f"Loading daily data       : {tactical_cfg.tickers} ({daily_start} → {end})")
+    daily_raw = _fetch_daily_cached(tactical_cfg.tickers, daily_start, end)
 
     tactical     = TacticalStrategy(tactical_cfg, account_cfg.tactical_capital, brokerage_cfg)
     experimental = ExperimentalStrategy(experimental_cfg, account_cfg.experimental_capital, brokerage_cfg)
@@ -348,12 +501,12 @@ def run_live(
             time.sleep(wait_secs)
             continue
 
-        logger.info(f"Market open — fetching hourly + daily data ({now_et.strftime('%d-%b-%y %H:%M')} ET)")
+        logger.info(f"Market open — loading hourly + daily data ({now_et.strftime('%d-%b-%y %H:%M')} ET)")
 
         try:
-            raw = _fetch_hourly(all_tickers, days=WARMUP_DAYS)
+            raw = _fetch_hourly_cached(all_tickers, days=WARMUP_DAYS)
         except Exception as e:
-            logger.error(f"Data fetch failed: {e}. Retrying next hour.")
+            logger.error(f"Data load failed: {e}. Retrying next hour.")
             time.sleep(3600)
             continue
 
@@ -362,13 +515,13 @@ def run_live(
             time.sleep(3600)
             continue
 
-        # Fetch daily data for knife-guard indicators
+        # Load daily data for knife-guard indicators (cache-aware)
         try:
             daily_end   = datetime.today().strftime("%Y-%m-%d")
             daily_start = (datetime.today() - timedelta(days=DAILY_WARMUP_DAYS)).strftime("%Y-%m-%d")
-            daily_raw   = _fetch_daily(tactical_cfg.tickers, daily_start, daily_end)
+            daily_raw   = _fetch_daily_cached(tactical_cfg.tickers, daily_start, daily_end)
         except Exception as e:
-            logger.warning(f"Daily data fetch failed: {e} — knife guards may be skipped.")
+            logger.warning(f"Daily data load failed: {e} — knife guards may be skipped.")
             daily_raw = None
 
         tactical_tmp     = TacticalStrategy(tactical_cfg, account_cfg.tactical_capital, brokerage_cfg)
@@ -851,24 +1004,24 @@ def run_live_ibkr(
             daily_summary_sent = False
             logger.info(f"=== Tick {now_et.strftime('%d-%b-%Y  %H:%M')} ET ===")
 
-            # ── 1. Fetch historical bars ──────────────────────────────── #
+            # ── 1. Load historical hourly bars (cache-aware) ──────────── #
             try:
-                raw = _fetch_hourly(all_tickers, days=WARMUP_DAYS)
+                raw = _fetch_hourly_cached(all_tickers, days=WARMUP_DAYS)
             except Exception as e:
-                logger.error(f"yfinance fetch failed: {e}. Retrying next hour.")
+                logger.error(f"Hourly data load failed: {e}. Retrying next hour.")
                 time.sleep(3600)
                 continue
 
             if raw.empty:
-                logger.warning("Empty yfinance data. Retrying next hour.")
+                logger.warning("Empty hourly data. Retrying next hour.")
                 time.sleep(3600)
                 continue
 
-            # ── 1b. Fetch daily bars for knife-guard indicators ───────── #
+            # ── 1b. Load daily bars for knife-guard indicators (cache-aware) #
             try:
                 daily_end_str   = datetime.today().strftime("%Y-%m-%d")
                 daily_start_str = (datetime.today() - timedelta(days=DAILY_WARMUP_DAYS)).strftime("%Y-%m-%d")
-                daily_raw_tick  = _fetch_daily(tactical_cfg.tickers, daily_start_str, daily_end_str)
+                daily_raw_tick  = _fetch_daily_cached(tactical_cfg.tickers, daily_start_str, daily_end_str)
                 tick_daily_maps: dict[str, dict] = {}
                 if not daily_raw_tick.empty:
                     today_date = now_et.date()
@@ -877,7 +1030,7 @@ def run_live_ibkr(
                         # Exclude today's incomplete bar (market is open)
                         tick_daily_maps[sym] = {d: v for d, v in dmap.items() if d < today_date}
             except Exception as e:
-                logger.warning(f"Daily data fetch failed: {e} — 52W/200MA guards may be skipped.")
+                logger.warning(f"Daily data load failed: {e} — 52W/200MA guards may be skipped.")
                 tick_daily_maps = {}
 
             # ── 2. Get latest prices ──────────────────────────────────── #

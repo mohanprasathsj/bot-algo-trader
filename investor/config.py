@@ -45,8 +45,8 @@ class TaxConfig:
 class AccountConfig:
     """Overall account settings."""
     total_capital: float = 2_000.0
-    tactical_pct: float = 0.80
-    experimental_pct: float = 0.20
+    tactical_pct: float = 1.00
+    experimental_pct: float = 0.00
     max_total_drawdown: float = 0.20
     min_cash_reserve_pct: float = 0.10
 

@@ -29,3 +29,5 @@ investor/logs/daily_*.txt
 *.local.*
 *.local
 
+cache/
+
